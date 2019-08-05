@@ -2,61 +2,29 @@ from datetime import datetime
 import math
 from random import random
 import jwt  # from PyJWT
-import argparse
 
 from flask import Flask, request, jsonify, abort
 from flask import make_response, redirect
 from flask.views import View
 from flask_classy import FlaskView, route
 
-from couchbase.bucket import Bucket
 from couchbase.n1ql import N1QLQuery
 from couchbase.exceptions import NotFoundError, CouchbaseNetworkError, \
     CouchbaseTransientError, CouchbaseDataError, SubdocPathNotFoundError
 import couchbase.fulltext as FT
 import couchbase.subdocument as SD
 
-# For Couchbase Server 5.0 there must be a username and password
-# User must have full access to read/write bucket/data and
-# Read access for Query and Search
-# Cluster Administrator user may be used
-# CONNSTR = 'couchbase://localhost/travel-sample?username=admin'
-# PASSWORD = 'admin123'
-
-DEFAULT_USER = "Administrator"
-PASSWORD = 'password'
-
-# For Couchbase Server 4.6 the travel-sample bucket does not
-# require username and password
-# CONNSTR = 'couchbase://localhost/travel-sample'
-# PASSWORD = ''
-parser = argparse.ArgumentParser()
-parser.add_argument('-c', '--cluster', help='Connection String i.e. localhost:8091')
-parser.add_argument('-u', '--user', help='User with access to bucket')
-parser.add_argument('-p', '--password', help='Password of user with access to bucket')
-args = parser.parse_args()
-
-if args.cluster:
-        CONNSTR = "couchbase://" + args.cluster + "/travel-sample"
-else:
-        CONNSTR = "couchbase://localhost/travel-sample"
-if args.user:
-        CONNSTR = CONNSTR + "?username=" + args.user
-else:
-        CONNSTR = CONNSTR + "?username=" + DEFAULT_USER
-if args.password:
-        PASSWORD = args.password
-
-print "Connecting to: " + CONNSTR
-
 app = Flask(__name__, static_url_path='/static')
+
 
 @app.route('/')
 @app.route('/static/')
 def index():
     return redirect("/static/index.html", code=302)
 
+
 app.config.from_object(__name__)
+
 
 def make_user_key(username):
     return 'user::' + username
@@ -180,6 +148,8 @@ class UserView(FlaskView):
         try:
             db.upsert(make_user_key(user), userrec)
             token = jwt.encode({'user': user}, 'cbtravelsample')
+            if isinstance(token, bytes):
+                token=token.decode('utf-8')
             respjson = jsonify({'data': {'token': token}})
         except CouchbaseDataError as e:
             abort(409)
@@ -191,7 +161,7 @@ class UserView(FlaskView):
         """List the flights that have been reserved by a user"""
         if request.method == 'GET':
             token = jwt.encode({'user': username}, 'cbtravelsample')
-            bearer = request.headers['Authorization'].split(" ")[1]
+            bearer = request.headers['Authentication'].split(" ")[1]
             if token != bearer:
                 return abortmsg(401, 'Username does not match token username')
 
@@ -209,7 +179,7 @@ class UserView(FlaskView):
             userdockey = make_user_key(username)
 
             token = jwt.encode({'user': username}, 'cbtravelsample')
-            bearer = request.headers['Authorization'].split(" ")[1]
+            bearer = request.headers['Authentication'].split(" ")[1]
 
             if token != bearer:
                 return abortmsg(401, 'Username does not match token username')
@@ -258,13 +228,13 @@ class HotelView(FlaskView):
         results = []
         for row in q:
             subdoc = db.retrieve_in(row['id'], 'country', 'city', 'state',
-                                    'address', 'name', 'description','title','phone','free_internet','pets_ok','free_parking','email','free_breakfast')
+                                    'address', 'name', 'description')
 
-            # Get the fields from the document, if they exist
-            addr = ', '.join(x for x in (
-                subdoc.get(y)[1] for y in ('address', 'city', 'state', 'country')) if x)
-            subresults = {'name': subdoc['name'], 'description': subdoc['description'], 'address': addr,'title':subdoc['title'],'phone':subdoc['phone'],'free_internet':subdoc['free_internet'],'pets_ok':subdoc['pets_ok'],'free_parking':subdoc['free_parking'],'email':subdoc['email'],'free_breakfast':subdoc['free_breakfast'],'id':row['id']}
-            results.append(subresults)
+        # Get the fields from the document, if they exist
+        addr = ', '.join(x for x in (
+            subdoc.get(y)[1] for y in ('address', 'city', 'state', 'country')) if x)
+        subresults = {'name': subdoc['name'], 'description': subdoc['description'], 'address': addr}
+        results.append(subresults)
 
         response = {'data': results}
         return jsonify(response)
@@ -278,7 +248,7 @@ def abortmsg(code, message):
 
 def convdate(rawdate):
     """Returns integer data from mm/dd/YYYY"""
-    day = datetime.strptime(rawdate, '%m/%d/%Y')
+    day = datetime.strptime(rawdate, '%m/%d/%Y') if rawdate else datetime.today()
     return day.weekday()
 
 
@@ -291,12 +261,35 @@ UserView.register(app, route_prefix='/api/')
 app.add_url_rule('/api/airports', view_func=Airport.as_view('airports'),
                  methods=['GET', 'OPTIONS'])
 
+details = {
+    'username': "default",
+    'password': 'password',
+    'hostname': '10.142.163.101'
+}
+
 
 def connect_db():
-    return Bucket(CONNSTR, password=PASSWORD)
+    import couchbase.cluster
+    CONNSTR = 'couchbase://{hostname}'.format(hostname=details.pop('hostname'))
+    cluster = couchbase.cluster.Cluster(CONNSTR)
+    cluster.authenticate(couchbase.cluster.PasswordAuthenticator(**details))
+    return cluster.open_bucket("travel-sample")
 
 
-db = connect_db()
+db = None
 
 if __name__ == "__main__":
-    app.run(debug=False, host='0.0.0.0', port=8080)
+    import argparse
+    parser = argparse.ArgumentParser(description='Couchbase Travel Sample App')
+    parser.add_argument('--username', type=str,
+                        help='username for travel-sample bucket')
+    parser.add_argument('--password', type=str,
+                        help='password for travel-sample bucket')
+    parser.add_argument('--hostname', type=str,
+                        help='Couchbase Server hostname')
+
+    details.update(vars(parser.parse_args()))
+    db = connect_db()
+
+    app.run(debug=False, host='localhost', port=8080)
+
